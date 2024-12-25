@@ -1,59 +1,71 @@
 package telran.net;
 
 import java.net.*;
-
-import org.json.JSONObject;
-
-import telran.net.exceptions.TooManyFailuresException;
-
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.io.*;
 
 public class TcpClientServerSession implements Runnable {
     Protocol protocol;
     Socket socket;
-    int responseCounter;
+    TcpServer server;
+    int idleTimeout;
+    int requestsPerSecond;
+    int nonOkResponses;
+    Instant timestamp = Instant.now();
 
-    public TcpClientServerSession(Protocol protocol, Socket socket) {
+    public TcpClientServerSession(Protocol protocol, Socket socket, TcpServer server) {
         this.protocol = protocol;
         this.socket = socket;
+        this.server = server;
     }
 
     @Override
     public void run() {
-        definingSoTimeout(socket);
+
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
                 PrintStream writer = new PrintStream(socket.getOutputStream())) {
             String request = null;
-            while ((request = reader.readLine()) != null) {
-                String response = protocol.getResponseWithJSON(request);
-                writer.println(response);
-                responseCounter(response);
+            while (!server.executor.isShutdown() && !isIdleTimeout()) {
+                try {
+                    request = reader.readLine();
+                    idleTimeout = 0;
+                    if (request == null || isRequestsPerSecond()) {
+                        break;
+                    }
+                    String response = protocol.getResponseWithJSON(request);
+                    if (isNonOkResponses(response)) {
+                        break;
+                    }
+                    writer.println(response);
+                } catch (SocketTimeoutException e) {
+                    idleTimeout += server.socketTimeout;
+                }
             }
             socket.close();
-        } catch (IOException e) {
+        } catch (Exception e) {
             System.out.println(e);
         }
     }
 
-    private void definingSoTimeout(Socket socket) {
-        try {
-            socket.setSoTimeout(10000);
-        } catch (SocketException e) {
-            System.out.println(e);
-        }
-    }
-
-    private void responseCounter(String response) throws SocketTimeoutException {
-        JSONObject jsonObj = new JSONObject(response);
-        String responseCodeString = jsonObj.getString(TcpConfigurationProperties.RESPONSE_CODE_FIELD);
-        ResponseCode responseCode = ResponseCode.valueOf(responseCodeString);
-        if (responseCode == ResponseCode.OK) {
-            responseCounter = 0;
-        } else if (responseCounter == 4) {
-            throw new TooManyFailuresException();
+    private boolean isRequestsPerSecond() {
+        Instant current = Instant.now();
+        if (ChronoUnit.SECONDS.between(timestamp, current) > 1) {
+            requestsPerSecond = 0;
+            timestamp = current;
         } else {
-            responseCounter++;
+            requestsPerSecond++;
         }
+        return requestsPerSecond > server.limitRequestsPerSecond;
+    }
+
+    private boolean isNonOkResponses(String response) {
+        nonOkResponses = response.contains("OK") ? 0 : nonOkResponses + 1;
+        return nonOkResponses > server.limitNonOkResponsesInRow;
+    }
+
+    private boolean isIdleTimeout() {
+        return idleTimeout > server.idleConnectionTimeout;
     }
 
 }
